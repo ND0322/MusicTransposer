@@ -25,18 +25,26 @@ class EigenDecomp():
         return eigValue, v, steps
     
 
+
     def QR(A, tol = 0.0001):
         Q,R = np.linalg.qr(A)
 
-        last = np.empty(shape = Q.shape)
+    
+
+
+        eigenvectors = Q
+        evs = R
 
         for i in range(500):
             last = Q.copy()
-            X = Q @ R
+            X = R @ Q
+            
 
             Q,R = np.linalg.qr(X)
 
-            if(np.allclose(X, np.triu(X)), atol = tol):
-                break
-        return Q
+            evs @= R
+            eigenvectors @= Q
 
+            if(np.allclose(X, np.triu(X), atol = tol)):
+                break
+        return np.array(eigenvectors), evs

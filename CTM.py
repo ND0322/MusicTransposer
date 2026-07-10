@@ -1,11 +1,23 @@
 import cv2
 import numpy as np
 from random import shuffle
-from server.Dsu import DSU
-
+from PCA import PCA
+import datetime
+import scipy
+from PIL import Image
 
 
 ADAPTIVE_WINSZ = 55  
+
+RVEC_IDX = slice(0, 3) 
+TVEC_IDX = slice(3, 6)
+CUBIC_IDX = slice(6, 8) 
+
+OUTPUT_ZOOM = 1.0     
+OUTPUT_DPI = 300    
+REMAP_DECIMATE = 16 
+
+FOCAL_LENGTH = 1.2
 
 CCOLORS = [
     (180, 100, 100),
@@ -33,6 +45,11 @@ CCOLORS = [
     (120, 140, 160),
     (160, 120, 140),
 ]
+
+K = np.array([
+    [FOCAL_LENGTH, 0, 0],
+    [0, FOCAL_LENGTH, 0],
+    [0, 0, 1]], dtype=np.float32)
 
 def resize_to_screen(src, maxw=1280, maxh=700, copy=False):
 
@@ -174,13 +191,12 @@ def process(img, mode = 0):
     analysis = cv2.connectedComponentsWithStats(connected,4,cv2.CV_32S)
     (totalLabels, label_ids, values, centroid) = analysis
 
-    # Initialize a new image to
-    # store all the output components
+
     output = np.zeros((img.shape[0],img.shape[1], 3), dtype="uint8")
 
     res = []
 
-    pagemask = get_page_extents(img)
+
 
     for i in range(1, totalLabels):
         area = values[i, cv2.CC_STAT_AREA]
@@ -240,6 +256,15 @@ def process(img, mode = 0):
 
 def swap(a, b):
     return b,a
+
+
+def round_nearest_multiple(i, factor):
+    i = int(i)
+    rem = i % factor
+    if not rem:
+        return i
+    else:
+        return i + factor - rem
 
 def interval_measure_overlap(a, b):
     return min(a[1], b[1]) - max(a[0], b[0])
@@ -496,7 +521,249 @@ def visualize_blobs(img, nodes):
     cv2.imshow("blobs", vis)
 
 
+def gen_keypoints(spanPoints, pagemask, page_outline):
+    evecs = np.array([[0.0, 0.0]])
+    weights = 0
+
+    for points in spanPoints:
+
+       
+        _, evec = cv2.PCACompute(points.reshape((-1, 2)), None, maxComponents=1)
+
+        weight = np.linalg.norm(points[-1] - points[0])
+
+        evecs += evec * weight
+        weights += weight
+
+    print("weights total:", weights)
+    print("evecs:", evecs)
+    evec = evecs/weights
+
+    xDir = evec.flatten()
+
+    if(xDir[0] < 0):
+        xDir *= -1
     
+    yDir = np.array([-xDir[1], xDir[0]])
+
+    coords = cv2.convexHull(page_outline)
+    coords = pix2norm(pagemask.shape, coords.reshape((-1, 1, 2)))
+    coords = coords.reshape((-1,2))
+
+    projx = np.dot(coords, xDir)
+    projy = np.dot(coords, yDir)
+
+    px0 = projx.min()
+    px1 = projx.max()
+
+    py0 = projy.min()
+    py1 = projy.max()
+
+    p00 = px0 * xDir + py0 * yDir
+    p10 = px1 * xDir + py0 * yDir
+    p11 = px1 * xDir + py1 * yDir
+    p01 = px0 * xDir + py1 * yDir
+
+    corners = np.vstack((p00, p10, p11, p01)).reshape((-1, 1, 2))
+
+    y = []
+    x = []
+
+    for points in spanPoints:
+        pts = points.reshape((-1, 2))
+        projx = np.dot(pts, xDir)
+        projy = np.dot(pts, yDir)
+        y.append(projy.mean() - py0)
+        x.append(projx- px0)
+
+    return corners, np.array(y), x
+
+def make_keypoint_index(span_counts):
+
+    nspans = len(span_counts)
+    npts = sum(span_counts)
+    keypoint_index = np.zeros((npts+1, 2), dtype=int)
+    start = 1
+
+    for i, count in enumerate(span_counts):
+        end = start + count
+        keypoint_index[start:end, 1] = 8+i
+        start = end
+
+    keypoint_index[1:, 0] = np.arange(npts) + 8 + nspans
+
+    return keypoint_index
+
+def get_default_params(corners, ycoords, xcoords):
+
+
+    page_width = np.linalg.norm(corners[1] - corners[0])
+    page_height = np.linalg.norm(corners[-1] - corners[0])
+    rough_dims = (page_width, page_height)
+
+    cubic_slopes = [0.0, 0.0]
+
+
+    corners_object3d = np.array([
+        [0, 0, 0],
+        [page_width, 0, 0],
+        [page_width, page_height, 0],
+        [0, page_height, 0]])
+
+    _, rvec, tvec = cv2.solvePnP(corners_object3d,
+                                 corners, K, np.zeros(5), flags=cv2.SOLVEPNP_IPPE)
+
+    span_counts = [len(xc) for xc in xcoords]
+
+    params = np.hstack((np.array(rvec).flatten(),
+                        np.array(tvec).flatten(),
+                        np.array(cubic_slopes).flatten(),
+                        ycoords.flatten()) +
+                       tuple(xcoords))
+
+    return rough_dims, span_counts, params
+
+def projxy(coords, pvec):
+    alpha, beta = tuple(pvec[CUBIC_IDX])
+
+
+    """
+    f(0) = 0, f'(0) = alpha
+    f(1) = 0, f'(1) = beta
+
+    ax^3 + bx^2 + cx + d
+
+    f' = 3ax^2 + 2bx + c
+
+    d = 0
+    c = alpha
+
+    a + b + alpha = 0
+    3a + 2b + alpha = beta
+
+    a = beta + alpha
+    b = -2 alpha - beta
+    """
+    poly = np.array([beta + alpha, -2 * alpha - beta, alpha, 0])
+    coords = coords.reshape((-1, 2))
+
+    vals = np.polyval(poly, coords[:, 0])
+
+    objPoints = np.hstack((coords, vals.reshape(-1, 1)))
+
+    p, _ = cv2.projectPoints(objPoints, pvec[RVEC_IDX], pvec[TVEC_IDX], K, np.zeros(5))
+
+    return p
+
+def project_keypoints(pvec, ind):
+    coords = pvec[ind]
+    coords[0, :] = 0
+
+    return projxy(coords, pvec)
+
+def optimizer(dstpoints, span_counts, params):
+    ind = make_keypoint_index(span_counts)
+
+    def objective(pvec):
+        pts = project_keypoints(pvec, ind)
+        return np.sum((dstpoints - pts) ** 2)
+    
+
+    print("intitial objective:", objective(params))
+
+    print("optmizing", len(params), 'paramters...')
+
+    start = datetime.datetime.now()
+
+    res = scipy.optimize.minimize(objective, params, method = "Powell")
+
+    end = datetime.datetime.now()
+
+    print("time elapsed:", round((end - start).total_seconds(), 2), 2, "sec")
+    print("final objective", res.fun)
+    return res.x
+
+
+def get_page_dims(corners, rough_dims, params):
+
+    dst_br = corners[2].flatten()
+
+    dims = np.array(rough_dims)
+
+    def objective(dims):
+        proj_br = projxy(dims, params)
+        return np.sum((dst_br - proj_br.flatten())**2)
+
+    res = scipy.optimize.minimize(objective, dims, method='Powell')
+    dims = res.x
+
+    return dims
+
+
+    
+def remap_image(name, img, small, page_dims, params):
+
+    height = 0.5 * page_dims[1] * OUTPUT_ZOOM * img.shape[0]
+    height = round_nearest_multiple(height, REMAP_DECIMATE)
+
+    width = round_nearest_multiple(height * page_dims[0] / page_dims[1],
+                                   REMAP_DECIMATE)
+
+
+    height_small = height // REMAP_DECIMATE
+    width_small = width // REMAP_DECIMATE
+
+    page_x_range = np.linspace(0, page_dims[0], width_small)
+    page_y_range = np.linspace(0, page_dims[1], height_small)
+
+    page_x_coords, page_y_coords = np.meshgrid(page_x_range, page_y_range)
+
+    page_xy_coords = np.hstack((page_x_coords.flatten().reshape((-1, 1)),
+                                page_y_coords.flatten().reshape((-1, 1))))
+
+    page_xy_coords = page_xy_coords.astype(np.float32)
+
+    image_points = projxy(page_xy_coords, params)
+    image_points = norm2pix(img.shape, image_points, False)
+
+    image_x_coords = image_points[:, 0, 0].reshape(page_x_coords.shape)
+    image_y_coords = image_points[:, 0, 1].reshape(page_y_coords.shape)
+
+    image_x_coords = cv2.resize(image_x_coords, (width, height),
+                            interpolation=cv2.INTER_CUBIC).astype(np.float32)
+
+    image_y_coords = cv2.resize(image_y_coords, (width, height),
+                            interpolation=cv2.INTER_CUBIC).astype(np.float32)
+
+    img_gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+    remapped = cv2.remap(img_gray, image_x_coords, image_y_coords,
+                         cv2.INTER_CUBIC,
+                         None, cv2.BORDER_REPLICATE)
+
+    thresh = cv2.adaptiveThreshold(remapped, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                   cv2.THRESH_BINARY, ADAPTIVE_WINSZ, 25)
+
+    pil_image = Image.fromarray(thresh)
+    pil_image = pil_image.convert('1')
+
+    threshfile = name + '_thresh.png'
+    pil_image.save(threshfile, dpi=(OUTPUT_DPI, OUTPUT_DPI))
+
+
+
+    return threshfile
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -515,11 +782,11 @@ small = resize_to_screen(img)
 
 tmp = small
 
-img, nodes = process(img)
+processed_vis, nodes = process(img)
 
+pagemask, page_outline = get_page_extents(small)
 
-
-visualize_blobs(img, nodes)
+visualize_blobs(processed_vis, nodes)
 
 nodes.insert(0, {"center": np.array([-1e9, -1e9]), "tangent": np.array([0, 0]), 
                   "l": np.array([0, 0]), "r": np.array([0, 0]), 
@@ -538,11 +805,27 @@ for i in range(1, len(nodes)):
 
 spans, nodes = get_spans(nodes)
 
-points = sample(nodes, spans, img.shape)
+points = sample(nodes, spans, small.shape)
+
 
 
 visualize_samples(tmp, points)
 
+corners, ycoords, xcoords = gen_keypoints(points, pagemask, page_outline)
+dims, span_counts, params = get_default_params(corners, ycoords, xcoords)
+
+dstpoints = np.vstack((corners[0].reshape((1,1,2)),) + tuple(points))
+
+
+
+params = optimizer(dstpoints, span_counts, params)
+
+
+
+page_dims = get_page_dims(corners, dims, params)
+
+
+outfile = remap_image("Wanker", img, small, page_dims, params)
 
 
 
