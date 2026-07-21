@@ -771,8 +771,8 @@ def remap_image(name, img, small, page_dims, params):
 
 #img = cv2.imread("images/IMG_2325.jpg")
 #img = cv2.imread("images/IMG_2326.jpg")
-#img = cv2.imread("images/IMG_2328.jpg")
-img = cv2.imread("images/linguistics_thesis_a.jpg")
+img = cv2.imread("images/IMG_2987.jpg")
+#img = cv2.imread("images/linguistics_thesis_a.jpg")
 
 
 
